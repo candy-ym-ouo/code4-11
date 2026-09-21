@@ -9,7 +9,7 @@ export type SourceType = (typeof sourceTypes)[number];
 export const stockUnits = ["g", "kg", "ml", "l", "mm", "cm", "m", "m2", "pcs"] as const;
 export type StockUnit = (typeof stockUnits)[number];
 
-export const batchStatuses = ["ACTIVE", "DEPLETED", "ARCHIVED"] as const;
+export const batchStatuses = ["PENDING", "ACTIVE", "DEPLETED", "ARCHIVED"] as const;
 export type BatchStatus = (typeof batchStatuses)[number];
 
 export const movementTypes = [
@@ -258,3 +258,83 @@ export type Pagination = {
   pageSize: number;
   total: number;
 };
+
+// ---------------------------------------------------------------------------
+// 批次标签（短码）与扫码定位
+// ---------------------------------------------------------------------------
+
+export const labelStatuses = ["ACTIVE", "VOIDED", "REPLACED"] as const;
+export type LabelStatus = (typeof labelStatuses)[number];
+
+export const scanResults = ["OK", "REPLACED", "VOIDED", "UNKNOWN"] as const;
+export type ScanResult = (typeof scanResults)[number];
+
+// 短码：8 位 Crockford Base32（不含 I L O U，末位为校验位），服务端生成。
+export const shortCodePattern = /^[0-9A-HJ-KM-NP-TV-Z]{8}$/;
+export const shortCodeInput = z
+  .string()
+  .trim()
+  .toUpperCase()
+  .regex(shortCodePattern, "短码必须是 8 位数字与大写字母");
+
+export const labelReprintSchema = z.object({
+  reason: z.string().trim().max(200).nullable().optional()
+});
+
+export const labelVoidSchema = z.object({
+  reason: z.string().trim().min(2, "作废原因至少 2 个字符").max(200)
+});
+
+export const labelReplaceSchema = z.object({
+  reason: z.string().trim().min(2, "换签原因至少 2 个字符").max(200)
+});
+
+const locationFields = {
+  locationName: z.string().trim().max(120).nullable().optional(),
+  latitude: z.number().gte(-90).lte(90).nullable().optional(),
+  longitude: z.number().gte(-180).lte(180).nullable().optional(),
+  note: z.string().trim().max(500).nullable().optional()
+};
+
+const scanBaseShape = {
+  eventId: z.string().uuid("事件 ID 必须是 UUID"),
+  shortCode: shortCodeInput,
+  scannedAt: z.string().datetime({ offset: true }),
+  deviceId: z.string().trim().min(1).max(80).optional(),
+  operator: z.string().trim().max(80).nullable().optional(),
+  ...locationFields
+};
+const refineScanLocation = <T extends z.ZodTypeAny>(schema: T) =>
+  schema.refine(
+    (value: { latitude?: number | null; longitude?: number | null }) =>
+      (value.latitude === null || value.latitude === undefined) === (value.longitude === null || value.longitude === undefined),
+    { message: "经纬度必须同时提供", path: ["longitude"] }
+  );
+
+// 在线单条扫码必须自带设备号。
+export const scanInputSchema = refineScanLocation(z.object(scanBaseShape).refine((value) => value.deviceId !== undefined, {
+  message: "deviceId 不能为空",
+  path: ["deviceId"]
+}));
+
+// 离线补传：设备号可用包级 deviceId 兜底。
+export const syncScanSchema = refineScanLocation(z.object(scanBaseShape));
+
+// 离线识别到的批次（OCR / 手工录入）：按 (材料, 批次号) 自然键幂等创建。
+export const batchRecognitionSchema = z.object({
+  eventId: z.string().uuid("事件 ID 必须是 UUID"),
+  materialId: z.string().uuid(),
+  batchCode: z.string().trim().min(1).max(64),
+  receivedAt: z.string().date().optional(),
+  deviceId: z.string().trim().min(1).max(80),
+  recognizedAt: z.string().datetime({ offset: true })
+});
+
+export const syncPayloadSchema = z.object({
+  deviceId: z.string().trim().min(1).max(80),
+  scans: z.array(syncScanSchema).max(2000).default([]),
+  recognitions: z.array(batchRecognitionSchema).max(1000).default([])
+}).refine((value) => value.scans.length > 0 || value.recognitions.length > 0, {
+  message: "补传至少包含一条扫码或识别记录",
+  path: ["scans"]
+});

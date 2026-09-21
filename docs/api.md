@@ -241,3 +241,81 @@
 - `file`
 
 支持 JPEG、PNG、WebP，默认最大 10 MB。
+
+## 10. 批次标签（短码）
+
+短码为 8 位 Crockford Base32（`0-9A-HJ-KM-NP-TV-Z`，剔除易混字符），末位为校验位；
+接口接受小写、连字符以及 `0/O`、`1/I/L` 的扫码误读，自动归一化。短码一经签发永不改变、
+永不回收；标签状态机为 `ACTIVE → REPRINT（印次+1）/ VOID / REPLACE`。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/batches/:id/labels` | 为批次签发标签（每批至多一枚 ACTIVE） |
+| GET | `/batches/:id/labels` | 该批次全部标签（含已作废、已换签） |
+| GET | `/labels/:code` | 标签详情与事件历史 |
+| POST | `/labels/:code/reprint` | 重印：短码不变，`printSeq` +1 |
+| POST | `/labels/:code/void` | 作废：`{ "reason": "..." }` |
+| POST | `/labels/:code/replace` | 换签：旧签置 REPLACED 并指向新签 |
+| GET | `/resolve/:code` | 只解析不落事件，返回当前定位结论 |
+
+换签会形成 predecessor → successor 链，扫旧码沿链返回最新有效签：
+
+- `OK`：当前有效签，直接定位批次。
+- `REPLACED`：该签已被换签，`effectiveLabel` 指向当前签，批次不变。
+- `VOIDED`：该签（或其换签链终点）已作废。
+- `UNKNOWN`：校验位合法但库里不存在。
+
+重印、作废、换签均支持 `Idempotency-Key`；对已作废签重复作废、对已换签旧码重复换签均幂等。
+
+## 11. 扫码定位与离线补传
+
+所有离线事件以客户端生成的 UUID `eventId` 去重；解析结论在首次入库时冻结，
+之后标签再被作废或换签也不改变历史结论。整包补传可任意重放，不会产生重复数据。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/scans` | 在线单条扫码 |
+| POST | `/recognitions` | 识别批次（OCR/手工录入），按自然键幂等建档 |
+| POST | `/sync` | 离线补传（扫码 + 识别混合包） |
+| POST | `/sync/status` | 按 `eventIds` 查询是否已入库 |
+| GET | `/batches/:id/scans` | 批次扫码轨迹（分页） |
+| GET | `/batches/:id/last-seen` | 最近一次有效扫码位置 |
+
+扫码事件：
+
+```json
+{
+  "eventId": "550e8400-e29b-41d4-a716-446655440000",
+  "shortCode": "3SYQV92P",
+  "scannedAt": "2026-09-20T08:00:00+08:00",
+  "deviceId": "PDA-42",
+  "operator": "张三",
+  "locationName": "染坊 A 区",
+  "latitude": 31.2304,
+  "longitude": 121.4737
+}
+```
+
+离线补传包：`scans[].deviceId` 可省略，自动用包级 `deviceId` 兜底。服务端逐条用
+SAVEPOINT 处理：单条失败只回滚该条并在响应中标记 `FAILED`，不影响其他条目。
+
+```json
+{
+  "deviceId": "PDA-42",
+  "scans": [ { "eventId": "...", "shortCode": "...", "scannedAt": "..." } ],
+  "recognitions": [
+    { "eventId": "...", "materialId": "uuid", "batchCode": "RC-001",
+      "receivedAt": "2026-09-20", "recognizedAt": "2026-09-20T11:00:00+08:00" }
+  ]
+}
+```
+
+响应中每条带 `APPLIED` / `DUPLICATE` / `FAILED` 状态，并有 `summary` 汇总。
+
+### 识别不产生重复批次
+
+识别以 `(材料, 批次号)`（大小写不敏感）为自然键：首次识别创建 `PENDING` 批次
+（数量 0、`recognizedAt` 记录识别时间）；之后无论是重复事件重放、不同设备、离线补传
+还是并发请求，都只返回同一批次。正式调用 `POST /batches` 入库时激活该 PENDING 批次
+（状态转 `ACTIVE`、写入初始数量与 OPENING 流水），不会新建第二条；对已存在的正式批次
+重复入库返回 `409 BATCH_CODE_EXISTS`。

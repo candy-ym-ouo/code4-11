@@ -24,3 +24,6 @@ pnpm-debug.log*
 .idea/
 .vscode/
 *.swp
+
+# Local native libs for embedded-postgres tests (arm64)
+apps/api/test-libs/

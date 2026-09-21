@@ -54,7 +54,7 @@ onMounted(() => {
         <el-form-item label="关键词"><el-input v-model="filters.q" clearable placeholder="材料、批次号、来源、颜色" @keyup.enter="load(1)" /></el-form-item>
         <el-form-item label="颜色"><el-input v-model="filters.color" clearable style="width: 150px" /></el-form-item>
         <el-form-item label="状态">
-          <el-select v-model="filters.status" clearable style="width: 130px"><el-option value="ACTIVE" label="有库存" /><el-option value="DEPLETED" label="已耗尽" /><el-option value="ARCHIVED" label="已归档" /></el-select>
+          <el-select v-model="filters.status" clearable style="width: 130px"><el-option value="PENDING" label="待入库" /><el-option value="ACTIVE" label="有库存" /><el-option value="DEPLETED" label="已耗尽" /><el-option value="ARCHIVED" label="已归档" /></el-select>
         </el-form-item>
         <el-form-item label="到期不晚于"><el-date-picker v-model="filters.expiryBefore" value-format="YYYY-MM-DD" type="date" /></el-form-item>
         <el-form-item><el-button type="primary" @click="load(1)">搜索</el-button><el-button @click="reset">重置</el-button></el-form-item>

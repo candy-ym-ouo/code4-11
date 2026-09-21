@@ -174,21 +174,62 @@ export async function batchRoutes(app: FastifyInstance): Promise<void> {
       }
       const initialColorName = input.initialColorName || material.default_color_name;
       const initialColorHex = input.initialColorHex || material.default_color_hex;
-      const batch = await client.query(
-        `INSERT INTO batches(material_id, batch_code, source_id, source_note, location_id, received_at, expiry_at,
-          initial_quantity, remaining_quantity, stock_unit, entry_unit, total_cost, currency,
-          initial_color_name, initial_color_hex, current_color_name, current_color_hex, color_updated_at, notes)
-         VALUES ($1, $2, $3, $4, $5, $6::date, $7::date, $8, $8, $9::stock_unit, $10::stock_unit, $11, $12,
-                 $13::varchar(80), $14::char(7), $13::varchar(80), $14::char(7), CASE WHEN $13 IS NULL AND $14 IS NULL THEN NULL ELSE now() END, $15)
-         RETURNING *`,
-        [
-          input.materialId, input.batchCode || null, input.sourceId || null, input.sourceNote || null,
-          input.locationId || null, input.receivedAt, input.expiryAt || null, normalizedQuantity,
-          material.stock_unit, input.entryUnit, input.totalCost ?? null, input.currency || null,
-          initialColorName, initialColorHex, input.notes || null
-        ]
+
+      // 自然键 (material_id, lower(batch_code)) 幂等：离线识别可能已建过 PENDING 批次，
+      // 正式入库时必须激活同一行，绝不新建第二个批次。
+      const naturalKey = await client.query(
+        "SELECT * FROM batches WHERE material_id = $1 AND lower(batch_code) = lower($2) FOR UPDATE",
+        [input.materialId, input.batchCode ?? ""]
       );
-      const batchId = batch.rows[0]?.id as string;
+      const pending = input.batchCode
+        ? naturalKey.rows.find((row) => row.status === "PENDING" && Number(row.remaining_quantity) === 0)
+        : undefined;
+      if (naturalKey.rows[0] && !pending) {
+        throw new AppError(409, "BATCH_CODE_EXISTS", "同一材料下该批次号已存在，重复入库请使用库存调整");
+      }
+
+      let batchRow: Record<string, unknown>;
+      if (pending) {
+        const activated = await client.query(
+          `UPDATE batches SET
+             source_id = COALESCE(source_id, $3), source_note = COALESCE(source_note, $4),
+             location_id = COALESCE(location_id, $5), received_at = $6::date,
+             expiry_at = $7::date, initial_quantity = $8, remaining_quantity = $8,
+             stock_unit = COALESCE(stock_unit, $9::stock_unit),
+             entry_unit = $10::stock_unit, total_cost = $11, currency = $12,
+             initial_color_name = COALESCE(initial_color_name, $13::varchar(80)),
+             initial_color_hex = COALESCE(initial_color_hex, $14::char(7)),
+             current_color_name = COALESCE(current_color_name, $13::varchar(80)),
+             current_color_hex = COALESCE(current_color_hex, $14::char(7)),
+             color_updated_at = COALESCE(color_updated_at, CASE WHEN $13 IS NULL AND $14 IS NULL THEN NULL ELSE now() END),
+             notes = COALESCE(NULLIF(notes, ''), $15), status = 'ACTIVE', version = version + 1
+            WHERE id = $2 AND material_id = $1::uuid RETURNING *`,
+          [
+            input.materialId, pending.id, input.sourceId || null, input.sourceNote || null,
+            input.locationId || null, input.receivedAt, input.expiryAt || null, normalizedQuantity,
+            material.stock_unit, input.entryUnit, input.totalCost ?? null, input.currency || null,
+            initialColorName, initialColorHex, input.notes || null
+          ]
+        );
+        batchRow = activated.rows[0]!;
+      } else {
+        const insertedBatch = await client.query(
+          `INSERT INTO batches(material_id, batch_code, source_id, source_note, location_id, received_at, expiry_at,
+            initial_quantity, remaining_quantity, stock_unit, entry_unit, total_cost, currency,
+            initial_color_name, initial_color_hex, current_color_name, current_color_hex, color_updated_at, notes)
+           VALUES ($1, $2, $3, $4, $5, $6::date, $7::date, $8, $8, $9::stock_unit, $10::stock_unit, $11, $12,
+                   $13::varchar(80), $14::char(7), $13::varchar(80), $14::char(7), CASE WHEN $13 IS NULL AND $14 IS NULL THEN NULL ELSE now() END, $15)
+           RETURNING *`,
+          [
+            input.materialId, input.batchCode || null, input.sourceId || null, input.sourceNote || null,
+            input.locationId || null, input.receivedAt, input.expiryAt || null, normalizedQuantity,
+            material.stock_unit, input.entryUnit, input.totalCost ?? null, input.currency || null,
+            initialColorName, initialColorHex, input.notes || null
+          ]
+        );
+        batchRow = insertedBatch.rows[0]!;
+      }
+      const batchId = batchRow.id as string;
       await client.query(
         `INSERT INTO stock_movements(batch_id, type, signed_quantity, stock_unit, before_quantity, after_quantity,
           reference_type, reference_id, actor_user_id, idempotency_key)
@@ -196,10 +237,10 @@ export async function batchRoutes(app: FastifyInstance): Promise<void> {
         [batchId, normalizedQuantity, material.stock_unit, user.id, idempotencyKey ?? null]
       );
       await writeAudit(client, {
-        actorUserId: user.id, action: "CREATE", entityType: "BATCH", entityId: batchId,
-        afterData: batch.rows[0], requestId: request.id
+        actorUserId: user.id, action: pending ? "ACTIVATE_PENDING" : "CREATE", entityType: "BATCH", entityId: batchId,
+        afterData: batchRow, requestId: request.id
       });
-      return { data: batch.rows[0], idempotent: false };
+      return { data: batchRow, idempotent: false };
     });
     return reply.status(created.idempotent ? 200 : 201).send({ data: created.data });
   });

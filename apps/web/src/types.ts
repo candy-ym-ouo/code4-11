@@ -121,6 +121,7 @@ export const craftTypeLabels: Record<string, string> = {
 };
 
 export const statusLabels: Record<string, string> = {
+  PENDING: "待入库",
   ACTIVE: "有库存",
   DEPLETED: "已耗尽",
   ARCHIVED: "已归档",
